@@ -1,0 +1,176 @@
+name: Verify release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Published version to verify, without leading v"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Verify public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/release/verify-published.mjs \
+            --version "${{ inputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --package "@blade-ai/orca" \
+            --bin "orca"
+
+  verify-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: v${{ inputs.version }}
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+      - name: Smoke the published Windows npm package
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "orca-npm-smoke"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Set-Content -Path (Join-Path $root "package.json") -Value '{"private":true}'
+          Push-Location $root
+          # npm can take minutes after a publish to serve the new version.
+          $attempts = 60
+          for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+            npm install --ignore-scripts --save-exact "@blade-ai/orca@${{ inputs.version }}"
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -eq $attempts) { throw "npm install failed $attempts times" }
+            Write-Host "npm install attempt $attempt/$attempts failed; retrying in 15s"
+            Start-Sleep -Seconds 15
+          }
+          node (Join-Path $root "node_modules/@blade-ai/orca/bin/orca.js") --version
+          Pop-Location
+      - name: Smoke the published PowerShell installer
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "orca-installer-smoke"
+          & ./install.ps1 `
+            -Repo "${{ github.repository }}" `
+            -Version "${{ inputs.version }}" `
+            -InstallDir (Join-Path $root "bin") `
+            -NonInteractive
+      - name: Smoke the installed native Windows runner and sandbox lifecycle
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "orca-native-helper-smoke"
+          $installDir = Join-Path (Join-Path $env:RUNNER_TEMP "orca-installer-smoke") "bin"
+          $runner = Join-Path $installDir "orca-windows-runner.exe"
+          $setup = Join-Path $installDir "orca-windows-sandbox-setup.exe"
+          $workspace = Join-Path $root "workspace"
+          $stateDir = Join-Path $root "state"
+          New-Item -ItemType Directory -Force -Path $workspace | Out-Null
+          New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+
+          # Record what this shell's pipeline actually feeds a native stdin.
+          $probe = '{"probe":1}' | & node -e "let b=[];process.stdin.on('data',d=>b.push(d)).on('end',()=>console.log(Buffer.concat(b).slice(0,8).toString('hex')))"
+          Write-Host "native stdin pipe first bytes: $probe"
+
+          # The PowerShell pipeline re-encodes text piped to native programs
+          # (BOM-carrying UTF-8 on hosted runners), and the helpers parse
+          # stdin as strict JSON bytes. Write the frame through the process
+          # API so the helpers receive exactly BOM-less UTF-8.
+          function Invoke-JsonHelper([string]$Exe, [string]$Json) {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $Exe
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.UseShellExecute = $false
+            $psi.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes("$Json`n")
+            $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+            $proc.StandardInput.Close()
+            $text = $proc.StandardOutput.ReadToEnd()
+            $proc.WaitForExit()
+            if ($proc.ExitCode -ne 0) {
+              throw "$(Split-Path -Leaf $Exe) exited with code $($proc.ExitCode): $text"
+            }
+            return $text
+          }
+
+          $runnerRequest = @{
+            version = 1
+            program = $env:ComSpec
+            args = @("/D", "/S", "/C", "echo orca-runner-release-smoke")
+            cwd = (Get-Location).Path
+            env = @{}
+            job_name = $null
+            forward_stdin = $false
+          } | ConvertTo-Json -Compress
+          $runnerResponseText = Invoke-JsonHelper $runner $runnerRequest
+          $runnerResponse = $runnerResponseText | ConvertFrom-Json
+          if (-not $runnerResponse.ok -or $runnerResponse.exit_code -ne 0) {
+            throw "native Windows runner smoke failed: $runnerResponseText"
+          }
+          $runnerOutput = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($runnerResponse.stdout_base64))
+          if ($runnerOutput -notmatch "orca-runner-release-smoke") {
+            throw "native Windows runner did not return captured child output"
+          }
+
+          function Invoke-SandboxSetup([string]$Operation) {
+            $request = @{
+              version = 1
+              operation = $Operation
+              state_dir = $stateDir
+              workspace = $workspace
+            } | ConvertTo-Json -Compress
+            $responseText = Invoke-JsonHelper $setup $request
+            $response = $responseText | ConvertFrom-Json
+            if (-not $response.ok) { throw "sandbox setup '$Operation' failed: $responseText" }
+            return $response
+          }
+
+          $provision = Invoke-SandboxSetup "provision"
+          if (-not $provision.receipt) { throw "sandbox provision did not return a receipt" }
+          $check = Invoke-SandboxSetup "check"
+          if (-not $check.receipt) { throw "sandbox check did not return a receipt" }
+          $repair = Invoke-SandboxSetup "repair"
+          if (-not $repair.receipt) { throw "sandbox repair did not return a receipt" }
+          $remove = Invoke-SandboxSetup "remove"
+          if (-not $remove.removed) { throw "sandbox remove did not revoke the workspace capability" }
+      - name: Verify the published Windows archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "orca-release-smoke"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          gh release download "v${{ inputs.version }}" --repo "${{ github.repository }}" --pattern "orca-${{ matrix.target }}.zip" --pattern "orca-${{ matrix.target }}.zip.sha256" --dir $root
+          $archive = Join-Path $root "orca-${{ matrix.target }}.zip"
+          $expected = ((Get-Content ("$archive.sha256") -Raw).Trim() -split "\s+")[0].ToLowerInvariant()
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) { throw "Windows release checksum mismatch" }
+          Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $root "extract") -Force
+          foreach ($member in @("orca-windows-runner.exe", "orca-windows-sandbox-setup.exe", "LICENSE")) {
+            if (-not (Test-Path (Join-Path $root "extract/$member") -PathType Leaf)) {
+              throw "Windows release bundle is missing $member"
+            }
+          }
+          & (Join-Path $root "extract/orca.exe") --version
