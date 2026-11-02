@@ -1,0 +1,617 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to validate, without leading v"
+        required: true
+        default: "0.1.0"
+
+permissions:
+  actions: read
+  checks: read
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Verify tagged commit passed main gates
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch origin main --depth=1
+          test "$(git rev-parse origin/main)" = "$GITHUB_SHA"
+          checks="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100")"
+          for name in linux-full native-x64 native-arm64; do
+            jq -e --arg name "$name" \
+              'any(.check_runs[]; .name == $name and .conclusion == "success" and .app.slug == "github-actions")' \
+              <<<"$checks" >/dev/null
+          done
+          runs="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/actions/runs" \
+            -f head_sha="$GITHUB_SHA" -f event=push -f status=completed -f per_page=100)"
+          for workflow in Linux Windows; do
+            jq -e --arg workflow "$workflow" --arg sha "$GITHUB_SHA" \
+              'any(.workflow_runs[]; .name == $workflow and .head_sha == $sha and .event == "push" and .conclusion == "success")' \
+              <<<"$runs" >/dev/null
+          done
+      - uses: dtolnay/rust-toolchain@stable
+        if: github.event_name == 'workflow_dispatch'
+      - uses: taiki-e/install-action@4dc1969decfa71b34f25aa7f3dd4656654d9ad1e # nextest
+        if: github.event_name == 'workflow_dispatch'
+      - uses: Swatinem/rust-cache@v2
+        if: github.event_name == 'workflow_dispatch'
+      - name: Install test runtime dependencies
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep bubblewrap
+      - name: Validate runtime surface contract
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          node scripts/test-validate-runtime-surface-contract.mjs
+          node scripts/validate-runtime-surface-contract.mjs
+          cargo metadata --locked --format-version 1 > /dev/null
+          cargo test -p orca-tui runtime_surface_contract --lib --locked
+      - name: Validate repository adapters and hygiene
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          python3 -m unittest discover -s terminal_bench -p 'test_*.py' -v
+          node scripts/test-repository-hygiene.mjs
+      - name: Run TUI library gate
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo nextest run -p orca-tui --lib --locked --profile ci-serial --retries 0
+      - name: Run TUI PTY contract gate
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo nextest run --test tui_pty_contract --locked --profile ci-serial --retries 0
+      - name: Run workspace gate
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo clippy --workspace --all-targets --locked -j 1
+          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0
+          cargo test -p orca-runtime --lib generation_stop_terminal_mapping_preserves_not_started_reasons --locked -- --test-threads=1
+          cargo test -p orca-runtime --lib surface_goal_terminal_checkpoint_failure_recovers_exact_verified_batch --locked -- --test-threads=1
+          cargo test -p orca-runtime --test runtime_host --locked -- --test-threads=1
+          cargo test -p orca-runtime --test subagent_observability_contract --locked -- --test-threads=1
+          cargo test -p orca-runtime --test runtime_surface_interaction --locked -- --test-threads=1
+          cargo test --test subagent_contract --locked -- --test-threads=1
+
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+      - name: Verify repository version sync
+        run: node scripts/release/verify-version-sync.mjs
+      - name: Validate reviewed platform boundaries
+        run: |
+          node scripts/test-validate-windows-platform-boundaries.mjs
+          node scripts/validate-windows-platform-boundaries.mjs
+          node scripts/test-validate-execution-broker-boundary.mjs
+          node scripts/validate-execution-broker-boundary.mjs
+      - id: version
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${DISPATCH_VERSION}"
+          fi
+
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release version '$version' is not a valid semver release version" >&2
+            exit 1
+          fi
+
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+          if [[ "$version" != "$cargo_version" ]]; then
+            echo "Release version $version does not match Cargo.toml version $cargo_version" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: [test, version]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            binary: orca
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            binary: orca
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary: orca
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary: orca
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            binary: orca.exe
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            binary: orca.exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@4dc1969decfa71b34f25aa7f3dd4656654d9ad1e # nextest
+        if: runner.os == 'Windows'
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux ARM64 linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - name: Run native Windows x64 behavior gates
+        if: github.event_name == 'workflow_dispatch' && matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        env:
+          RUST_BACKTRACE: "1"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test -p orca-provider prompt_names_powershell_7_as_the_active_shell_dialect --locked -- --nocapture
+          cargo test -p orca-tui altgr_char_is_normalized_to_text_input_on_windows_only --locked -- --nocapture
+          cargo test -p orca-runtime windows_standalone_update_uses_downloaded_powershell_installer --locked -- --nocapture
+          cargo test -p orca-runtime windows_npm_update_waits_for_running_orca_before_replacing_package --locked -- --nocapture
+          cargo test -p orca-runtime --lib goal_runtime_lease_is_shared_in_process_and_exclusive_across_processes --locked -- --nocapture
+          cargo test -p orca-runtime --test runtime_surface_commit thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority --locked -- --nocapture
+          cargo test --test history_contract history_rename_search_and_compress_work_for_latest --locked -- --nocapture
+          cargo build -p orca-windows-runner --locked
+          cargo nextest run -p orca-tui --lib --locked --profile ci-serial --retries 0
+          cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass --retries 0
+          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0
+      - name: Run native Windows ARM64 behavior gates
+        if: github.event_name == 'workflow_dispatch' && matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test -p orca-platform --locked -- --nocapture
+          cargo test -p orca-windows-sandbox --locked -- --nocapture
+          cargo test -p orca-tools sandbox --locked -- --nocapture
+          cargo test -p orca-runtime native_windows_shells_accept_capability_sandbox_modes --locked -- --nocapture
+          cargo test -p orca-runtime restricted_windows_pty_session_keeps_terminal_and_resizes --locked -- --nocapture
+          cargo test -p orca-runtime native_pty_capabilities_match_supported_hosts --locked -- --nocapture
+          cargo test --test session_server_contract server_mode_reports_shell_capabilities --locked -- --nocapture
+          cargo test -p orca-provider prompt_names_powershell_7_as_the_active_shell_dialect --locked -- --nocapture
+          cargo test -p orca-tui altgr_char_is_normalized_to_text_input_on_windows_only --locked -- --nocapture
+          cargo test -p orca-runtime windows_standalone_update_uses_downloaded_powershell_installer --locked -- --nocapture
+          cargo test -p orca-runtime windows_npm_update_waits_for_running_orca_before_replacing_package --locked -- --nocapture
+          cargo test -p orca-runtime --lib goal_runtime_lease_is_shared_in_process_and_exclusive_across_processes --locked -- --nocapture
+          cargo test -p orca-runtime --test runtime_surface_commit thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority --locked -- --nocapture
+          cargo test --test history_contract history_rename_search_and_compress_work_for_latest --locked -- --nocapture
+          cargo build -p orca-windows-runner --locked
+          cargo nextest run -p orca-tui --lib --locked --profile ci-serial --retries 0
+          cargo nextest run --test tui_pty_contract --locked --profile ci-serial --no-tests=pass --retries 0
+          cargo nextest run --workspace --all-targets --locked --profile ci --no-fail-fast --retries 0
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} --locked
+      - name: Smoke the native Windows release binary
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: '& "target/${{ matrix.target }}/release/orca.exe" --version'
+      - name: Package
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "dist/orca-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/orca" "dist/orca-${{ matrix.target }}/orca"
+          tar -C "dist/orca-${{ matrix.target }}" -czf "dist/orca-${{ matrix.target }}.tar.gz" orca
+          shasum -a 256 "dist/orca-${{ matrix.target }}.tar.gz" > "dist/orca-${{ matrix.target }}.tar.gz.sha256"
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $stage = "dist/orca-${{ matrix.target }}"
+          $archive = "dist/orca-${{ matrix.target }}.zip"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/orca.exe" "$stage/orca.exe"
+          Copy-Item "target/${{ matrix.target }}/release/orca-windows-runner.exe" "$stage/orca-windows-runner.exe"
+          Copy-Item "target/${{ matrix.target }}/release/orca-windows-sandbox-setup.exe" "$stage/orca-windows-sandbox-setup.exe"
+          Copy-Item "LICENSE" "$stage/LICENSE"
+          Compress-Archive -Path "$stage/*" -DestinationPath $archive -Force
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$hash  orca-${{ matrix.target }}.zip" | Set-Content -Encoding ascii "$archive.sha256"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: orca-${{ matrix.target }}
+          path: |
+            dist/orca-${{ matrix.target }}/*
+            dist/orca-${{ matrix.target }}.${{ matrix.archive }}
+            dist/orca-${{ matrix.target }}.${{ matrix.archive }}.sha256
+
+  npm-trust:
+    if: github.ref_type == 'tag'
+    needs: [version]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    steps:
+      - name: Require npm trusted publishing for this workflow
+        shell: bash
+        run: |
+          # The exchange npm publish performs (npm >= 11.5.1), done before any public asset exists.
+          id_token="$(curl -fsS -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm:registry.npmjs.org" | jq -r '.value // empty')"
+          test -n "$id_token" || { echo "GitHub did not issue an OIDC token" >&2; exit 1; }
+          status="$(curl -sS -o exchange.json -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer ${id_token}" \
+            "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/@blade-ai%2forca")"
+          # npm answers a successful exchange with 201 Created.
+          if [[ ! "$status" =~ ^2[0-9][0-9]$ ]] || ! jq -e '(.token // "") | length > 0' exchange.json >/dev/null; then
+            echo "npm refused the trusted-publishing exchange (HTTP ${status}): $(jq -r '.message // .error // empty' exchange.json 2>/dev/null)" >&2
+            echo "Configure a trusted publisher for @blade-ai/orca: GitHub Actions, echoVic/orca-agent, workflow release.yml." >&2
+            rm -f exchange.json
+            exit 1
+          fi
+          rm -f exchange.json
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [build, version, npm-trust]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist/artifacts
+          merge-multiple: true
+      - name: Collect release assets
+        shell: bash
+        run: |
+          mkdir -p dist/release
+          find dist/artifacts -name '*.tar.gz' -exec cp {} dist/release/ \;
+          find dist/artifacts -name '*.zip' -exec cp {} dist/release/ \;
+          find dist/artifacts -name '*.sha256' -exec cp {} dist/release/ \;
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Orca ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/release/*
+
+  npm:
+    if: github.ref_type == 'tag'
+    needs: [build, version, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22.14.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Use an npm that supports trusted publishing
+        # Node 22.14.0 bundles npm 10.9.2; the OIDC exchange arrived in npm 11.5.1.
+        run: |
+          npm install -g npm@11.20.0
+          npm --version
+      - uses: actions/download-artifact@v5
+        with:
+          path: dist/artifacts
+          merge-multiple: true
+      - name: Stage npm packages
+        run: |
+          node scripts/release/stage-npm.mjs \
+            --version "${{ needs.version.outputs.version }}" \
+            --artifacts-dir dist/artifacts \
+            --out-dir dist/npm \
+            --pack
+      - name: Smoke current platform npm package
+        run: |
+          node scripts/release/smoke-npm.mjs \
+            --version "${{ needs.version.outputs.version }}" \
+            --stage-dir dist/npm/stage \
+            --tarballs-dir dist/npm/tarballs
+      - name: Upload npm tarballs artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: npm-tarballs
+          path: dist/npm/tarballs/*.tgz
+      - name: Publish npm packages
+        shell: bash
+        run: |
+          version="${{ needs.version.outputs.version }}"
+          tarballs=(
+            "dist/npm/tarballs/blade-ai-orca-${version}-darwin-arm64.tgz" \
+            "dist/npm/tarballs/blade-ai-orca-${version}-darwin-x64.tgz" \
+            "dist/npm/tarballs/blade-ai-orca-${version}-linux-arm64.tgz" \
+            "dist/npm/tarballs/blade-ai-orca-${version}-linux-x64.tgz" \
+            "dist/npm/tarballs/blade-ai-orca-${version}-win32-arm64.tgz" \
+            "dist/npm/tarballs/blade-ai-orca-${version}-win32-x64.tgz" \
+            "dist/npm/tarballs/blade-ai-orca-${version}.tgz"
+          )
+          declare -A existing
+          for tarball in "${tarballs[@]}"; do
+            test -f "$tarball"
+            package_version="$(tar -xOf "$tarball" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')"
+            local_integrity="sha512-$(node -e 'const fs=require("fs"),c=require("crypto");process.stdout.write(c.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"))' "$tarball")"
+            set +e
+            registry_output="$(npm view "@blade-ai/orca@${package_version}" dist.integrity --json 2>&1)"
+            registry_status=$?
+            set -e
+            if [[ $registry_status -eq 0 ]]; then
+              registry_integrity="$(node -e 'process.stdout.write(JSON.parse(process.argv[1]))' "$registry_output")"
+              if [[ "$registry_integrity" != "$local_integrity" ]]; then
+                echo "@blade-ai/orca@${package_version} exists with different registry integrity" >&2
+                exit 1
+              fi
+              existing["$package_version"]=1
+            elif [[ "$registry_output" != *E404* ]]; then
+              echo "$registry_output" >&2
+              exit "$registry_status"
+            fi
+          done
+          for tarball in "${tarballs[@]}"; do
+            package_version="$(tar -xOf "$tarball" package/package.json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>console.log(JSON.parse(s).version))')"
+            if [[ "${existing[$package_version]:-}" = 1 ]]; then
+              echo "@blade-ai/orca@${package_version} already published with identical integrity"
+              continue
+            fi
+            tag=latest
+            [[ "$package_version" == *-* ]] && tag=native
+            npm publish "$tarball" --access public --tag "$tag"
+          done
+
+  npm-release-assets:
+    if: ${{ always() && github.ref_type == 'tag' && needs.npm.result == 'success' }}
+    needs: [npm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          name: npm-tarballs
+          path: dist/npm/tarballs
+      - name: Upload npm tarballs to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: dist/npm/tarballs/*.tgz
+
+  verify:
+    if: ${{ always() && github.ref_type == 'tag' }}
+    needs: [version, release, npm, npm-release-assets]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require every publication rail
+        env:
+          RELEASE_RESULT: ${{ needs.release.result }}
+          NPM_RESULT: ${{ needs.npm.result }}
+          ASSETS_RESULT: ${{ needs.npm-release-assets.result }}
+        run: |
+          test "$RELEASE_RESULT" = success
+          test "$NPM_RESULT" = success
+          test "$ASSETS_RESULT" = success
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - name: Verify public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          node scripts/release/verify-published.mjs \
+            --version "${{ needs.version.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --package "@blade-ai/orca" \
+            --bin "orca"
+
+  verify-windows:
+    if: ${{ always() && github.ref_type == 'tag' && needs.npm.result == 'success' && needs['npm-release-assets'].result == 'success' }}
+    needs: [version, npm, npm-release-assets]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            npm_alias: "@blade-ai/orca-win32-x64"
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            npm_alias: "@blade-ai/orca-win32-arm64"
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+      - name: Smoke the published Windows npm package
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "orca-npm-smoke"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          Set-Content -Path (Join-Path $root "package.json") -Value '{"private":true}'
+          Push-Location $root
+          # npm can take minutes after a publish to serve the new version, and
+          # until it serves this runner's platform package it installs the main
+          # one without it, so wait for both.
+          $platform = Join-Path $root "node_modules/${{ matrix.npm_alias }}/package.json"
+          $attempts = 60
+          for ($attempt = 1; $attempt -le $attempts; $attempt++) {
+            npm install --ignore-scripts --save-exact --prefer-online "@blade-ai/orca@${{ needs.version.outputs.version }}"
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $platform)) { break }
+            if ($attempt -eq $attempts) { throw "npm install did not bring ${{ matrix.npm_alias }} in $attempts attempts" }
+            Write-Host "npm install attempt $attempt/$attempts failed or lacked ${{ matrix.npm_alias }}; retrying in 15s"
+            Remove-Item -Recurse -Force -ErrorAction SilentlyContinue (Join-Path $root "node_modules"), (Join-Path $root "package-lock.json")
+            Start-Sleep -Seconds 15
+          }
+          node (Join-Path $root "node_modules/@blade-ai/orca/bin/orca.js") --version
+          Pop-Location
+      - name: Smoke the published PowerShell installer
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "orca-installer-smoke"
+          & ./install.ps1 `
+            -Repo "${{ github.repository }}" `
+            -Version "${{ needs.version.outputs.version }}" `
+            -InstallDir (Join-Path $root "bin") `
+            -NonInteractive
+      - name: Smoke the installed native Windows runner and sandbox lifecycle
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "orca-native-helper-smoke"
+          $installDir = Join-Path (Join-Path $env:RUNNER_TEMP "orca-installer-smoke") "bin"
+          $runner = Join-Path $installDir "orca-windows-runner.exe"
+          $setup = Join-Path $installDir "orca-windows-sandbox-setup.exe"
+          $workspace = Join-Path $root "workspace"
+          $stateDir = Join-Path $root "state"
+          New-Item -ItemType Directory -Force -Path $workspace | Out-Null
+          New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+
+          # The PowerShell pipeline re-encodes text piped to native programs
+          # (BOM-carrying UTF-8 on hosted runners), and the helpers parse
+          # stdin as strict JSON bytes. Write the frame through the process
+          # API so the helpers receive exactly BOM-less UTF-8.
+          function Invoke-JsonHelper([string]$Exe, [string]$Json) {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $Exe
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.UseShellExecute = $false
+            $psi.StandardInputEncoding = [System.Text.UTF8Encoding]::new($false)
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes("$Json`n")
+            $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+            $proc.StandardInput.Close()
+            $text = $proc.StandardOutput.ReadToEnd()
+            $proc.WaitForExit()
+            if ($proc.ExitCode -ne 0) {
+              throw "$(Split-Path -Leaf $Exe) exited with code $($proc.ExitCode): $text"
+            }
+            return $text
+          }
+
+          $runnerRequest = @{
+            version = 1
+            program = $env:ComSpec
+            args = @("/D", "/S", "/C", "echo orca-runner-release-smoke")
+            cwd = (Get-Location).Path
+            env = @{}
+            job_name = $null
+            forward_stdin = $false
+          } | ConvertTo-Json -Compress
+          $runnerResponseText = Invoke-JsonHelper $runner $runnerRequest
+          $runnerResponse = $runnerResponseText | ConvertFrom-Json
+          if (-not $runnerResponse.ok -or $runnerResponse.exit_code -ne 0) {
+            throw "native Windows runner smoke failed: $runnerResponseText"
+          }
+          $runnerOutput = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($runnerResponse.stdout_base64))
+          if ($runnerOutput -notmatch "orca-runner-release-smoke") {
+            throw "native Windows runner did not return captured child output"
+          }
+
+          function Invoke-SandboxSetup([string]$Operation) {
+            $request = @{
+              version = 1
+              operation = $Operation
+              state_dir = $stateDir
+              workspace = $workspace
+            } | ConvertTo-Json -Compress
+            $responseText = Invoke-JsonHelper $setup $request
+            $response = $responseText | ConvertFrom-Json
+            if (-not $response.ok) { throw "sandbox setup '$Operation' failed: $responseText" }
+            return $response
+          }
+
+          $provision = Invoke-SandboxSetup "provision"
+          if (-not $provision.receipt) { throw "sandbox provision did not return a receipt" }
+          $check = Invoke-SandboxSetup "check"
+          if (-not $check.receipt) { throw "sandbox check did not return a receipt" }
+          $repair = Invoke-SandboxSetup "repair"
+          if (-not $repair.receipt) { throw "sandbox repair did not return a receipt" }
+          $remove = Invoke-SandboxSetup "remove"
+          if (-not $remove.removed) { throw "sandbox remove did not revoke the workspace capability" }
+      - name: Verify the published Windows archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: powershell
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "orca-release-smoke"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+          gh release download "${{ github.ref_name }}" --repo "${{ github.repository }}" --pattern "orca-${{ matrix.target }}.zip" --pattern "orca-${{ matrix.target }}.zip.sha256" --dir $root
+          $archive = Join-Path $root "orca-${{ matrix.target }}.zip"
+          $expected = ((Get-Content ("$archive.sha256") -Raw).Trim() -split "\s+")[0].ToLowerInvariant()
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) { throw "Windows release checksum mismatch" }
+          Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $root "extract") -Force
+          foreach ($member in @("orca-windows-runner.exe", "orca-windows-sandbox-setup.exe", "LICENSE")) {
+            if (-not (Test-Path (Join-Path $root "extract/$member") -PathType Leaf)) {
+              throw "Windows release bundle is missing $member"
+            }
+          }
+          & (Join-Path $root "extract/orca.exe") --version
+
+  pages:
+    if: ${{ github.ref_type == 'tag' && needs.verify.result == 'success' && needs.verify-windows.result == 'success' }}
+    needs: [verify, verify-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch Pages after public release verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --repo "${{ github.repository }}" --ref main
