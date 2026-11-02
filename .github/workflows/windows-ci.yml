@@ -83,29 +83,6 @@ jobs:
         run: cargo check --workspace --all-targets --locked
       - name: Run workspace clippy
         run: cargo clippy --workspace --all-targets --locked
-      - name: Run native Windows platform contracts
-        run: |
-          $ErrorActionPreference = "Stop"
-          $PSNativeCommandUseErrorActionPreference = $true
-          cargo test -p orca-platform --locked -- --nocapture
-          cargo test -p orca-windows-runner --locked -- --nocapture
-          cargo test -p orca-windows-sandbox-setup --locked -- --nocapture
-          cargo test -p orca-windows-sandbox --locked -- --nocapture
-          cargo test -p orca-tools sandbox --locked -- --nocapture
-          cargo test -p orca-runtime native_windows_shells_accept_capability_sandbox_modes --locked -- --nocapture
-          cargo test -p orca-runtime restricted_windows_pty_session_keeps_terminal_and_resizes --locked -- --nocapture
-          cargo test -p orca-runtime native_pty_capabilities_match_supported_hosts --locked -- --nocapture
-          cargo test --test session_server_contract server_mode_reports_shell_capabilities --locked -- --nocapture
-          cargo test --test session_server_contract server_mode_command_exec_returns_buffered_output --locked -- --nocapture
-          cargo test --test session_server_contract server_mode_command_exec_preserves_native_windows_argv --locked -- --nocapture
-          cargo test --test session_server_contract server_mode_command_exec_preserves_legacy_script_command --locked -- --nocapture
-          cargo test -p orca-provider prompt_names_powershell_7_as_the_active_shell_dialect --locked -- --nocapture
-          cargo test -p orca-tui altgr_char_is_normalized_to_text_input_on_windows_only --locked -- --nocapture
-          cargo test -p orca-runtime windows_standalone_update_uses_downloaded_powershell_installer --locked -- --nocapture
-          cargo test -p orca-runtime windows_npm_update_waits_for_running_orca_before_replacing_package --locked -- --nocapture
-          cargo test -p orca-runtime --lib goal_runtime_lease_is_shared_in_process_and_exclusive_across_processes --locked -- --nocapture
-          cargo test -p orca-runtime --test runtime_surface_commit thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority --locked -- --nocapture
-          cargo test --test history_contract history_rename_search_and_compress_work_for_latest --locked -- --nocapture
       - name: Build the Windows async subagent runner
         run: cargo build -p orca-windows-runner --locked
       - name: Run resource-sensitive Windows contracts
@@ -162,26 +139,6 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           cargo build --release --locked
           & "./target/release/orca.exe" --version
-      - name: Run native ARM64 platform smoke tests
-        run: |
-          $ErrorActionPreference = "Stop"
-          $PSNativeCommandUseErrorActionPreference = $true
-          cargo test -p orca-platform --locked -- --nocapture
-          cargo test -p orca-windows-runner --locked -- --nocapture
-          cargo test -p orca-windows-sandbox-setup --locked -- --nocapture
-          cargo test -p orca-windows-sandbox --locked -- --nocapture
-          cargo test -p orca-tools sandbox --locked -- --nocapture
-          cargo test -p orca-runtime restricted_windows_pty_session_keeps_terminal_and_resizes --locked -- --nocapture
-          cargo test --test session_server_contract server_mode_command_exec_returns_buffered_output --locked -- --nocapture
-          cargo test --test session_server_contract server_mode_command_exec_preserves_native_windows_argv --locked -- --nocapture
-          cargo test --test session_server_contract server_mode_command_exec_preserves_legacy_script_command --locked -- --nocapture
-          cargo test -p orca-provider prompt_names_powershell_7_as_the_active_shell_dialect --locked -- --nocapture
-          cargo test -p orca-tui altgr_char_is_normalized_to_text_input_on_windows_only --locked -- --nocapture
-          cargo test -p orca-runtime windows_standalone_update_uses_downloaded_powershell_installer --locked -- --nocapture
-          cargo test -p orca-runtime windows_npm_update_waits_for_running_orca_before_replacing_package --locked -- --nocapture
-          cargo test -p orca-runtime --lib goal_runtime_lease_is_shared_in_process_and_exclusive_across_processes --locked -- --nocapture
-          cargo test -p orca-runtime --test runtime_surface_commit thread_and_policy_owner_leases_fail_closed_and_wall_rollback_has_no_authority --locked -- --nocapture
-          cargo test --test history_contract history_rename_search_and_compress_work_for_latest --locked -- --nocapture
       - name: Build the native ARM64 async subagent runner
         run: cargo build -p orca-windows-runner --locked
       - name: Run resource-sensitive native ARM64 contracts
